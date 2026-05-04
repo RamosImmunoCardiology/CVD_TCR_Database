@@ -1,0 +1,906 @@
+
+
+
+
+
+```{r}
+library(readxl)
+
+df <- read_excel(".../CVD_TCR_Template.xlsx")
+
+```
+####this can be used in case you have issues with TRAV and TRBV harmonization issues across different studies
+##harmonize TRBV
+```{r}
+#subset to mouse
+df <- df[df$Species == "Mouse", ]
+
+
+library(dplyr)
+library(stringr)
+library(dplyr)
+library(stringr)
+
+# List of Mouse single-member families where "-1" is often an artifact
+single_member_families <- c(
+  "TRBV1", "TRBV2", "TRBV3", "TRBV4", "TRBV5", 
+  "TRBV10", "TRBV15", "TRBV16", "TRBV17", "TRBV19", 
+  "TRBV20", "TRBV23", "TRBV24", "TRBV26", "TRBV29", 
+  "TRBV30", "TRBV31"
+)
+
+df <- df %>%
+  mutate(
+    # Start with the original column
+    TRBV_harmonized = TRBV,
+    
+    # Harmonize "-1" artifacts 
+    TRBV_harmonized = if_else(
+      # Condition: Ends in "-1" AND the prefix is in our single-member list
+      str_detect(TRBV_harmonized, "-1$") & 
+      str_remove(TRBV_harmonized, "-1$") %in% single_member_families,
+      
+      # True: Remove the "-1" (e.g., TRBV19-1 -> TRBV19)
+      str_remove(TRBV_harmonized, "-1$"),
+      
+      # False: Keep as is (Preserves TRBV12-2+TRBV13-2, TRBV13-1, etc.)
+      TRBV_harmonized
+    ),
+    
+    # Handle string "NA"
+    TRBV_harmonized = na_if(TRBV_harmonized, "NA")
+  )
+
+# --- Verification ---
+# Check what changed (Should only be the -1 merges, no splits)
+df %>%
+  distinct(Original = TRBV, Harmonized = TRBV_harmonized) %>%
+  filter(Original != Harmonized) %>%
+  arrange(Original) %>%
+  print(n = 50)
+
+```
+
+
+##put a flag for TRAV harmonization
+```{r}
+library(dplyr)
+library(stringr)
+
+df <- df %>%
+  mutate(
+    # Start with original
+    TRAV_harmonized = TRAV,
+    
+    # 1. Remove Allele information (*04)
+    #    Regex: Find '*' followed by any digits and remove it
+    TRAV_harmonized = str_remove(TRAV_harmonized, "\\*\\d+$"),
+    
+    # 2. Harmonize N/D designations
+    #    We remove 'N' or 'D' only if it follows a number and comes before a hyphen or end of string.
+    #    Examples: 
+    #    TRAV14N-1 -> TRAV14-1
+    #    TRAV16N   -> TRAV16
+    #    TRAV7D-3  -> TRAV7-3
+    TRAV_harmonized = str_replace_all(TRAV_harmonized, "(?<=\\d)[ND](?=[-\\d]|$)", ""),
+    
+    # 3. Handle NA strings
+    TRAV_harmonized = na_if(TRAV_harmonized, "NA")
+  )
+
+# --- Verification ---
+# Let's see how the messy names got cleaned up
+df %>%
+  distinct(Original = TRAV, Harmonized = TRAV_harmonized) %>%
+  filter(Original != Harmonized) %>%
+  arrange(Harmonized) %>%
+  print(n = 100)
+```
+
+
+
+```{r}
+library(dplyr)
+
+# Remove rows only if every column is identical
+df2 <- df %>% 
+  distinct()
+```
+
+
+##save cleaned df
+```{r}
+library(writexl)
+write_xlsx(df2, path = ".../CVD_TCR_Template_new.xlsx")
+```
+
+
+
+###Create a Jaccard overlap matrix
+```{r}
+#2️⃣ Build Category-level CDR3β sets
+library(dplyr)
+library(purrr)
+
+cdr3b_sets <- df2 %>%
+  filter(!is.na(CDR3.beta.aa)) %>%
+  group_by(Category) %>%
+  summarise(
+    CDR3b_set = list(unique(CDR3.beta.aa)),
+    .groups = "drop"
+  )
+#3️⃣ Jaccard overlap matrix
+jaccard <- function(a, b) {
+  length(intersect(a, b)) / length(union(a, b))
+}
+pathologies <- cdr3b_sets$Category
+
+jaccard_mat <- matrix(
+  nrow = length(pathologies),
+  ncol = length(pathologies),
+  dimnames = list(pathologies, pathologies)
+)
+
+for (i in seq_along(pathologies)) {
+  for (j in seq_along(pathologies)) {
+    jaccard_mat[i, j] <- jaccard(
+      cdr3b_sets$CDR3b_set[[i]],
+      cdr3b_sets$CDR3b_set[[j]]
+    )
+  }
+}
+
+jaccard_mat
+#4️⃣ Cluster pathologies by CDR3β overlap
+dist_mat <- as.dist(1 - jaccard_mat)
+
+hc <- hclust(dist_mat, method = "average")
+
+
+```
+
+
+
+
+###plot Jaccard overlap for CDR3b aa
+```{r}
+
+off_diag <- jaccard_mat[upper.tri(jaccard_mat)]
+off_diag_pos <- off_diag[off_diag > 0]
+summary(off_diag_pos)
+
+library(ComplexHeatmap)
+library(circlize)
+
+pmin <- min(off_diag_pos)
+pmed <- as.numeric(quantile(off_diag_pos, 0.5))
+pmax <- max(off_diag_pos)
+
+col_fun <- colorRamp2(
+  c(0, pmin, pmed, pmax),
+  c("white", "mistyrose", "orange", "red")
+)
+
+jaccard_plot <- jaccard_mat
+diag(jaccard_plot) <- NA
+
+cell_fun <- function(j, i, x, y, w, h, fill) {
+  val <- jaccard_plot[i, j]
+  if (!is.na(val) && val > 0) {
+    grid::grid.text(sprintf("%.3g", val), x, y,
+                    gp = grid::gpar(fontsize = 8))
+  }
+}
+
+library(ComplexHeatmap)
+library(circlize)
+library(stringr) 
+
+# 1. Formatting: Wrap long row names
+rownames(jaccard_plot) <- str_wrap(rownames(jaccard_plot), width = 30)
+
+# 2. Define the cell function with larger font
+cell_fun_custom = function(j, i, x, y, width, height, fill) {
+  if(!is.na(jaccard_plot[i, j])) {
+    grid.text(sprintf("%.5f", jaccard_plot[i, j]), 
+              x, y, 
+              gp = gpar(fontsize = 12)) # increased font size
+  }
+}
+
+Heatmap(
+  jaccard_plot,
+  name = "Jaccard",
+  col = col_fun,
+  
+  # We use the clustering object (hc) to determine the ORDER of rows/cols...
+  cluster_rows = hc,
+  cluster_columns = hc,
+  # ...but we set the width/height of the dendrogram to ZERO to hide it.
+  show_row_dend = FALSE,
+  show_column_dend = FALSE,
+  # -----------------------
+
+  row_names_side = "left",
+  
+  # Automatically reserve space for the now-wrapped long labels
+  row_names_max_width = max_text_width(rownames(jaccard_plot), 
+                                       gp = gpar(fontsize = 12)),
+  
+  column_names_rot = 45,
+  na_col = "white",
+  cell_fun = cell_fun_custom,
+  rect_gp = grid::gpar(col = "grey80", lwd = 0.5),
+  column_title = "CDR3β Jaccard overlap between pathologies"
+)
+```
+
+
+
+
+##table generation for figure 3B
+```{r}
+library(dplyr)
+library(tidyr)
+library(ComplexHeatmap)
+library(circlize)
+
+# 1) Presence table
+cdr3_presence <- df2 %>%
+  filter(!is.na(CDR3.beta.aa)) %>%
+  distinct(Category, CDR3.beta.aa)
+
+# 2) Count publicness (#pathologies per CDR3β)
+cdr3_counts <- cdr3_presence %>%
+  count(CDR3.beta.aa, name = "n_pathologies")
+
+# Choose threshold or top N
+k_public <- 2   # try 3 or 4
+topN <- 60      # or use top N to keep plot readable
+
+cdr3_top <- cdr3_counts %>%
+  filter(n_pathologies >= k_public) %>%
+  arrange(desc(n_pathologies)) %>%
+  slice_head(n = topN) %>%
+  pull(CDR3.beta.aa)
+
+
+# 3) Build a binary matrix: rows=CDR3β, cols=Pathology
+mat_df <- cdr3_presence %>%
+  filter(CDR3.beta.aa %in% cdr3_top) %>%
+  mutate(present = 1) %>%
+  pivot_wider(names_from = Category, values_from = present, values_fill = 0)
+
+mat <- as.matrix(mat_df[,-1])
+rownames(mat) <- mat_df$CDR3.beta.aa
+
+# 4) Add row annotation: publicness
+row_pub <- cdr3_counts %>%
+  filter(CDR3.beta.aa %in% rownames(mat)) %>%
+  distinct(CDR3.beta.aa, n_pathologies) %>%
+  tibble::deframe()
+
+row_ha <- rowAnnotation(
+  n_pathologies = row_pub[rownames(mat)],
+  col = list(n_pathologies = colorRamp2(
+    c(min(row_pub), max(row_pub)),
+    c("lightgrey", "black")
+  ))
+)
+
+##generate summary statistics to be used in complexheatmap
+
+heatmap_seq_df <- df2 %>%
+  # 1. Keep only the sequences that made it into your heatmap
+  filter(CDR3.beta.aa %in% cdr3_top) %>%
+  
+  # 2. Group by sequence to calculate stats per CDR3
+  group_by(CDR3.beta.aa) %>%
+  
+  # 3. Create the summary columns
+  summarise(
+    # a) & b) PubMed IDs: List them and count them
+    PubMed_IDs = paste(unique(`PubMed ID`), collapse = "; "),
+    n_PubMed_IDs = n_distinct(`PubMed ID`),
+    
+    # c) & d) Categories: List them and count them
+    Categories = paste(unique(Category), collapse = "; "),
+    n_Categories = n_distinct(Category)
+  ) %>%
+  
+  # Optional: Arrange by most shared, then by most citations
+  arrange(desc(n_Categories), desc(n_PubMed_IDs))
+
+# View the result
+print(heatmap_seq_df)
+```
+
+###figure 3B
+```{r}
+library(ComplexHeatmap)
+library(circlize)
+library(dplyr)
+library(RColorBrewer)
+
+# --- 1. Data Prep ---
+stats_df <- heatmap_seq_df %>%
+  filter(CDR3.beta.aa %in% rownames(mat)) %>%
+  arrange(factor(CDR3.beta.aa, levels = rownames(mat)))
+
+# --- 2. Define Colors & Order ---
+# Define the strict order for Pathologies (Columns)
+pathology_order <- colnames(mat) 
+
+# Assign colors to this specific order
+pathology_colors <- RColorBrewer::brewer.pal(n = length(pathology_order), name = "Dark2")
+names(pathology_colors) <- pathology_order
+
+# Colors for stats
+col_publicness <- colorRamp2(c(2, 4), c("#FFEDA0", "#F03B20")) 
+col_papers     <- colorRamp2(c(0, max(stats_df$n_PubMed_IDs)), c("white", "steelblue"))
+
+# --- 3. Build Annotations ---
+
+# Top Annotation: Pathology Bar
+ha_top <- HeatmapAnnotation(
+  # FORCE the factor levels to match your column order so Legend doesn't alphabetize
+  Category = factor(colnames(mat), levels = pathology_order),
+  col = list(Category = pathology_colors),
+  show_annotation_name = FALSE,
+  annotation_legend_param = list(Category = list(title = "Pathology", at = pathology_order))
+)
+
+# Right Annotation: Stats Blocks with Numbers
+ha_right <- rowAnnotation(
+  
+  "N Pathologies" = anno_simple(
+    stats_df$n_Categories, 
+    col = col_publicness,
+    pch = as.character(stats_df$n_Categories), # Add number
+    pt_gp = gpar(fontsize = 9),
+    height = unit(5, "mm")
+  ),
+  
+  "N Studies" = anno_simple(
+    stats_df$n_PubMed_IDs, 
+    col = col_papers,
+    # HERE is the change: Add the number for Papers too
+    pch = as.character(stats_df$n_PubMed_IDs), 
+    pt_gp = gpar(fontsize = 9),
+    height = unit(5, "mm")
+  ),
+  
+  gap = unit(2, "mm")
+)
+
+# --- 4. Plot ---
+cell_size <- 0.5 
+ht_width  <- unit(ncol(mat) * cell_size, "cm")
+ht_height <- unit(nrow(mat) * cell_size, "cm")
+
+
+tiff("shared_CDR3b_mouse", units="in", width=9, height = 20, res=200)
+Heatmap(
+  mat,
+  name = "Present",
+  col = c("0" = "white", "1" = "grey30"),
+  
+  width = ht_width,
+  height = ht_height,
+  rect_gp = gpar(col = "grey90", lwd = 1),
+  
+  # Column Settings
+  cluster_columns = FALSE,    # <--- FALSE ensures Legend matches Top Bar order
+  column_order = pathology_order, # Explicitly use our order
+  show_column_names = FALSE,
+  top_annotation = ha_top,
+  
+  # Row Settings
+  cluster_rows = TRUE, 
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 8),
+  right_annotation = ha_right,
+  
+  column_title = paste0("Shared CDR3β Sequences ")
+)
+dev.off()
+```
+
+###Fig 3C
+#network GLIPH2 analysis-Mouse
+```{r}
+library(dplyr)
+library(turboGliph) # Assuming you have this installed
+
+# Load mouse reference database for GLIPH (update the path as needed)
+mouse_ref <- read.table(
+  ##tubrogliph automatically compares the input sequences to a human reference database of CDR3s. For mouse data, you need to load the provided mouse ref data
+  file = "/media/ag_ramos/TOSHIBA_EXT/usb stick/ref/mouse_v1.0/mouse_v1.0/ref_CD4_8_ms.txt",
+  sep = '\t',
+  header = TRUE
+)
+
+
+# --- 1. Filter and Format Input Data ---
+# We rename columns to standard GLIPH nomenclature
+gliph_table <- df2 %>%
+  # Filter out missing CDR3s
+  filter(!is.na(CDR3.beta.aa), CDR3.beta.aa != "") %>%
+  
+  # Select and Rename for GLIPH
+  select(
+    CDR3b = CDR3.beta.aa, 
+    patient = Category # Mapping 'Category' to 'patient' lets GLIPH track groups
+  ) %>%
+  distinct() 
+
+# --- 2. Run TurboGliph ---
+gliph_results <- turboGliph::gliph_combined(
+  cdr3_sequences = gliph_table,
+  lcminove = c(100, 10, 2), 
+  lcminp = 0.05, 
+  # Ensure we look for local motifs of size 2, 3, and 4
+  motif_length = c(2, 3, 4),
+
+  local_method = "fisher",
+  boost_local_significance = TRUE,
+  global_method = "fisher",
+  clustering_method = "GLIPH2.0", 
+  scoring_method = "GLIPH2.0",
+  n_cores = 1,
+    refdb_beta = mouse_ref,
+    cluster_min_size = 3
+)
+```
+
+
+
+```{r}
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(stringr)
+
+# --- 1. Identify the "Seed" Clusters ---
+seeds <- gliph_results$cluster_properties %>%
+  filter(cluster_size >= 10) %>%
+  arrange(desc(cluster_size)) %>%
+  mutate(Cluster_ID = row_number()) # Assign ID
+
+# Prepare the Global Edge List (Used to find secondary connections/branches)
+all_edges_raw <- gliph_results$cluster_properties %>%
+  select(tag, members) %>%
+  separate_rows(members, sep = " ") %>%
+  rename(Motif = tag, CDR3 = members)
+
+# --- 2. Build Independent Networks ---
+# We build a separate edge list for each cluster, tagging nodes to prevent merging
+
+master_edges <- data.frame()
+
+for (i in 1:nrow(seeds)) {
+  
+  # A. Get the Main Hub and its Members
+  seed_motif <- seeds$tag[i]
+  seed_id <- seeds$Cluster_ID[i]
+  
+  # Get the members of this specific cluster
+  members <- unlist(strsplit(seeds$members[i], " "))
+  
+  # B. Find ALL connections for these members (Branching)
+  # We look at the global list: What OTHER motifs do these members have?
+  sub_edges <- all_edges_raw %>%
+    filter(CDR3 %in% members)
+  
+  #  Make IDs Unique
+
+  sub_edges <- sub_edges %>%
+    mutate(
+      from_node = paste0(Motif, "__", seed_id),  # Unique Motif ID
+      to_node = paste0(CDR3, "__", seed_id),     # Unique CDR3 ID
+      Original_Motif = Motif,
+      Original_CDR3 = CDR3,
+      Cluster_Group = seed_id
+    ) %>%
+    select(from_node, to_node, Original_Motif, Original_CDR3, Cluster_Group)
+  
+  # D. Add to Master List
+  master_edges <- bind_rows(master_edges, sub_edges)
+}
+
+# --- 3. Build Node Metadata ---
+
+# Get base metadata from df2
+cdr3_meta <- df2 %>%
+  group_by(CDR3.beta.aa) %>%
+  summarise(
+    Category = ifelse(n_distinct(Category) > 1, "Shared/Mixed", first(Category)),
+    size_metric = n(),
+    .groups = "drop"
+  )
+
+# Create Node List for the Graph
+nodes_unique <- data.frame(name = unique(c(master_edges$from_node, master_edges$to_node))) %>%
+  separate(name, into = c("Real_Name", "Cluster_ID"), sep = "__", remove = FALSE) %>%
+  left_join(cdr3_meta, by = c("Real_Name" = "CDR3.beta.aa")) %>%
+  mutate(
+    # Determine Type based on whether it matched a CDR3 in df2
+    type = ifelse(is.na(size_metric), "Motif", "CDR3"),
+    # Fill NAs for Motifs
+    Category = ifelse(type == "Motif", "Motif", Category),
+    size_metric = ifelse(type == "Motif", 1, size_metric)
+  )
+```
+
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# --- 1. Prepare Reference Data ---
+
+all_edges_raw <- gliph_results$cluster_properties %>%
+  select(tag, members) %>%
+  separate_rows(members, sep = " ") %>%
+  rename(Motif = tag, CDR3 = members)
+
+# Get the Top  Seeds
+seeds <- gliph_results$cluster_properties %>%
+  filter(cluster_size >= 10) %>%
+  arrange(desc(cluster_size)) %>%
+  mutate(Cluster_ID = row_number())
+
+# --- 2. The Expansion Loop ---
+expanded_table <- data.frame()
+
+for (i in 1:nrow(seeds)) {
+  
+  # A. Define the Core
+  current_seed_motif <- seeds$tag[i]
+  current_cluster_id <- seeds$Cluster_ID[i]
+  
+  # Core Members (The ones in the plot)
+  core_members <- unlist(strsplit(seeds$members[i], " "))
+  
+  # B. Find Bridges (Secondary Motifs held by Core Members)
+  # We look for ANY motif attached to a Core Member
+  member_connections <- all_edges_raw %>%
+    filter(CDR3 %in% core_members)
+  
+  secondary_motifs <- unique(member_connections$Motif)
+  # Exclude the seed itself from being a "bridge" to itself
+  secondary_motifs <- setdiff(secondary_motifs, current_seed_motif)
+  
+  # C. Find Neighbors (The Expansion)
+  # Find ALL CDR3s connected to these Secondary Motifs
+  neighbor_connections <- all_edges_raw %>%
+    filter(Motif %in% secondary_motifs)
+  
+  # D. Classify the Sequences
+  # We analyze every unique CDR3 found in this extended network
+  all_involved_cdr3s <- unique(c(core_members, neighbor_connections$CDR3))
+  
+  # Build a mini-table for this cluster
+  cluster_profile <- data.frame(CDR3 = all_involved_cdr3s) %>%
+    mutate(
+      Cluster_ID = current_cluster_id,
+      Seed_Motif = current_seed_motif,
+      
+      # CLASSIFICATION:
+      # Core = Has the Seed Motif (is in the original member list)
+      # Neighbor = Does NOT have the Seed Motif (brought in by a bridge)
+      Type = ifelse(CDR3 %in% core_members, "Core Member", "Neighbor/Deviation")
+    )
+  
+  # E. Add Connectivity Details 
+  # For each CDR3, list the motifs that link it to this cluster
+  
+  # 1. Get all motifs for these CDR3s
+  relevant_edges <- all_edges_raw %>%
+    filter(CDR3 %in% all_involved_cdr3s) %>%
+    filter(Motif %in% c(current_seed_motif, secondary_motifs)) # Only count relevant motifs
+  
+  # 2. Summarize motifs per CDR3
+  motif_summaries <- relevant_edges %>%
+    group_by(CDR3) %>%
+    summarise(
+      Connected_Motifs = paste(unique(Motif), collapse = " + "),
+      N_Motifs = n_distinct(Motif),
+      # Check if it connects to the Seed
+      Has_Seed = any(Motif == current_seed_motif)
+    )
+  
+  # Join back
+  cluster_profile <- cluster_profile %>%
+    left_join(motif_summaries, by = "CDR3") %>%
+    # Double check the classification
+    mutate(Type = ifelse(Has_Seed, "Core Member", "Neighbor/Deviation"))
+  
+  # Add to Master
+  expanded_table <- bind_rows(expanded_table, cluster_profile)
+}
+
+# --- 3. Add Metadata (Publicness/Pathology) ---
+# Join with your df2 metadata
+final_expansion_table <- expanded_table %>%
+  left_join(cdr3_meta, by = c("CDR3" = "CDR3.beta.aa")) %>%
+  select(
+    Cluster_ID,
+    Seed_Motif,
+    Type,
+    CDR3,
+    Category,
+    Publicness = size_metric,
+    N_Motifs,
+    Connected_Motifs
+  ) %>%
+  arrange(Cluster_ID, Type, desc(Publicness))
+
+# --- 4. View and Export ---
+print(head(final_expansion_table, 20))
+
+# Save
+write.csv(final_expansion_table, "GLIPH2_Cluster_Expansion_Analysis_mouse.csv", row.names = FALSE)
+```
+
+
+
+
+
+```{r}
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(stringr)
+
+# --- 1. SETTINGS ---
+#change numbers according to how many you want to visualize
+N_CLUSTERS <- 5               
+NODE_SIZE_RANGE <- c(1, 4)  # Reduced range for smaller bubbles
+EDGE_WIDTH <- 0.4
+FONT_SIZE <- 10
+MOTIF_SIZE <- 1             # Standard size for ALL motifs (Seed & Secondary)
+
+# --- 2. PREPARE DATA ---
+all_edges_raw <- gliph_results$cluster_properties %>%
+  select(tag, members) %>%
+  mutate(members = trimws(members)) %>% 
+  separate_rows(members, sep = " ") %>%
+  rename(Motif = tag, CDR3 = members) %>%
+  filter(!is.na(CDR3) & CDR3 != "") %>%
+  filter(!is.na(Motif) & Motif != "")
+
+seeds <- gliph_results$cluster_properties %>%
+  filter(cluster_size >= 10) %>%
+  arrange(desc(cluster_size)) %>%
+  mutate(Cluster_ID = row_number())
+
+# --- 3. LOOP: BUILD TOP CLUSTERS ---
+master_edges <- data.frame()
+master_nodes_meta <- data.frame()
+csv_export_list <- list()
+
+message(paste("Processing Top", N_CLUSTERS, "Clusters..."))
+
+for (i in 1:N_CLUSTERS) {
+  
+  target_seed_row <- seeds[i, ]
+  current_seed <- target_seed_row$tag
+  seed_id <- target_seed_row$Cluster_ID
+  
+  core_members <- unlist(strsplit(target_seed_row$members, " "))
+  core_members <- trimws(core_members)
+  core_members <- core_members[core_members != "" & !is.na(core_members)]
+  
+  # Level 1: Core
+  l1_edges <- data.frame(
+    from = current_seed, to = core_members,
+    type = "Core_Connection", length_factor = 0.1 
+  )
+  
+  # Level 2: Bridges
+  core_connections <- all_edges_raw %>%
+    filter(CDR3 %in% core_members) %>%
+    filter(Motif != current_seed) 
+  
+  if(nrow(core_connections) > 0) {
+    l2_edges <- core_connections %>%
+      rename(from = Motif, to = CDR3) %>%
+      group_by(from) %>% slice(1) %>% ungroup() %>%
+      mutate(type = "Bridge_Connection", length_factor = 50.0)
+    
+    # Level 3: Neighbors
+    secondary_motifs <- unique(l2_edges$from)
+    neighbor_connections <- all_edges_raw %>%
+      filter(Motif %in% secondary_motifs) %>%
+      filter(!CDR3 %in% core_members) 
+    
+    if(nrow(neighbor_connections) > 0) {
+      l3_edges <- neighbor_connections %>%
+        rename(from = Motif, to = CDR3) %>%
+        group_by(to) %>% slice_sample(n = 1) %>% ungroup() %>%
+        mutate(type = "Neighbor_Connection", length_factor = 0.1)
+    } else { l3_edges <- data.frame() }
+  } else { l2_edges <- data.frame(); l3_edges <- data.frame() }
+  
+  # Combine
+  cluster_label_text <- paste0("#", seed_id, ": ", current_seed)
+  cluster_edges <- bind_rows(l1_edges, l2_edges, l3_edges) %>%
+    mutate(
+      from_node = paste0(from, "__", seed_id),
+      to_node = paste0(to, "__", seed_id),
+      Cluster_Label = cluster_label_text
+    ) %>%
+    select(from_node, to_node, type, length_factor, Cluster_Label)
+  
+  master_edges <- bind_rows(master_edges, cluster_edges)
+  
+  # Metadata
+  unique_nodes <- unique(c(cluster_edges$from_node, cluster_edges$to_node))
+  node_df <- data.frame(name = unique_nodes) %>%
+    separate(name, into = c("Real_Name", "Cluster_ID"), sep = "__", remove = FALSE) %>%
+    mutate(is_seed = Real_Name == current_seed, Cluster_Label = cluster_label_text)
+  
+  master_nodes_meta <- bind_rows(master_nodes_meta, node_df)
+  
+  # CSV Data
+  nodes_in_plot_real <- node_df$Real_Name[!node_df$Real_Name %in% all_edges_raw$Motif]
+  detailed_connections <- all_edges_raw %>%
+    filter(CDR3 %in% nodes_in_plot_real) %>%
+    group_by(CDR3) %>%
+    summarise(
+      All_Connected_Motifs = paste(unique(Motif), collapse = ", "),
+      Num_Motifs = n_distinct(Motif),
+      Has_Seed = any(Motif == current_seed),
+      .groups = "drop"
+    )
+  
+  cluster_csv <- node_df %>%
+    filter(!Real_Name %in% all_edges_raw$Motif) %>%
+    left_join(df2, by = c("Real_Name" = "CDR3.beta.aa")) %>%
+    group_by(Real_Name) %>%
+    summarise(
+      Category = ifelse(n_distinct(Category) > 1, "Shared/Mixed", first(Category)),
+      Shared_Count = n(),
+      .groups = "drop"
+    ) %>%
+    left_join(detailed_connections, by = c("Real_Name" = "CDR3")) %>%
+    mutate(Cluster_Rank = seed_id, Seed_Motif = current_seed,
+           Role = ifelse(Has_Seed, "Core Member", "Neighbor (Deviation)")) %>%
+    select(Cluster_Rank, Seed_Motif, CDR3=Real_Name, Role, Category, Shared_Count, Num_Motifs, All_Connected_Motifs)
+  
+  csv_export_list[[i]] <- cluster_csv
+}
+
+# --- 4. BUILD & LAYOUT ---
+edges_clean <- data.frame(
+  from = master_edges$from_node, to = master_edges$to_node,
+  type = master_edges$type, length_factor = master_edges$length_factor,
+  stringsAsFactors = FALSE
+)
+
+cdr3_counts <- df2 %>%
+  group_by(CDR3.beta.aa) %>%
+  summarise(
+    Category = ifelse(n_distinct(Category) > 1, "Shared/Mixed", first(Category)),
+    size_metric = n(), .groups = "drop"
+  )
+
+nodes_clean <- master_nodes_meta %>%
+  distinct(name, .keep_all = TRUE) %>%
+  left_join(cdr3_counts, by = c("Real_Name" = "CDR3.beta.aa")) %>%
+  mutate(
+    type = ifelse(is.na(size_metric), "Motif", "CDR3"),
+    Category = ifelse(type == "Motif", "Motif", Category),
+    size_metric = ifelse(type == "Motif", 1, size_metric)
+  )
+
+valid_nodes <- nodes_clean$name
+edges_clean <- edges_clean[edges_clean$from %in% valid_nodes & edges_clean$to %in% valid_nodes, ]
+
+g_master <- graph_from_data_frame(d = edges_clean, vertices = nodes_clean, directed = FALSE)
+g_master <- as_tbl_graph(g_master)
+
+# Decompose & Layout
+subgraphs <- decompose(g_master)
+get_id <- function(g) as.numeric(sub(".*__", "", V(g)$name[1]))
+subgraphs <- subgraphs[order(sapply(subgraphs, get_id))]
+
+coords_master <- data.frame()
+labels_master <- data.frame() # New DF to store Title positions
+PLOT_WIDTH <- 60
+x_cursor <- 0; y_cursor <- 0; row_max_height <- 0; padding <- 20.0 # Increased padding for Titles
+
+message("Calculating layouts...")
+for (g in subgraphs) {
+  E(g)$length_factor <- as.numeric(E(g)$length_factor)
+  E(g)$length_factor[is.na(E(g)$length_factor)] <- 1.0
+  
+  l <- tryCatch({
+    layout_with_graphopt(g, charge = 0.02, spring.length = E(g)$length_factor, spring.constant = 1)
+  }, error = function(e) { layout_with_fr(g, weights = 1/E(g)$length_factor) })
+  
+  l[,1] <- scales::rescale(l[,1], to = c(-1, 1)) * sqrt(vcount(g))
+  l[,2] <- scales::rescale(l[,2], to = c(-1, 1)) * sqrt(vcount(g))
+  
+  x_min <- min(l[,1]); x_max <- max(l[,1])
+  y_min <- min(l[,2]); y_max <- max(l[,2])
+  w <- x_max - x_min; h <- y_max - y_min
+  
+  if ((x_cursor + w) > PLOT_WIDTH) {
+    x_cursor <- 0; y_cursor <- y_cursor - row_max_height - padding; row_max_height <- 0
+  }
+  if (h > row_max_height) row_max_height <- h
+  
+  l[,1] <- l[,1] - x_min + x_cursor
+  l[,2] <- l[,2] - y_max + y_cursor
+  
+  # Calculate Title Position (Top Center of this cluster)
+  title_x <- mean(range(l[,1]))
+  title_y <- max(l[,2]) + 3.0 # Shift slightly above the highest node
+  
+  labels_master <- bind_rows(labels_master, data.frame(
+    x = title_x, y = title_y, 
+    label = unique(V(g)$Cluster_Label)[1]
+  ))
+  
+  coords_master <- bind_rows(coords_master, data.frame(name = V(g)$name, x = l[,1], y = l[,2]))
+  x_cursor <- x_cursor + w + padding
+}
+
+# --- 5. PLOT ---
+nodes_in_plot <- coords_master$name
+g_final <- g_master %>% activate(nodes) %>% filter(name %in% nodes_in_plot)
+coords_final <- coords_master %>% arrange(match(name, V(g_final)$name))
+layout_matrix <- as.matrix(coords_final[, c("x", "y")])
+
+cats <- setdiff(unique(nodes_clean$Category), "Motif")
+my_pal <- colorRampPalette(brewer.pal(8, "Set1"))(length(cats))
+names(my_pal) <- cats
+my_colors <- c(my_pal, "Motif" = "black") 
+if("Shared/Mixed" %in% names(my_colors)) my_colors["Shared/Mixed"] <- "grey50"
+
+p <- ggraph(g_final, layout = layout_matrix) + 
+  geom_edge_link(alpha = 0.3, color = "grey60", width = EDGE_WIDTH) + 
+  
+  # CDR3 Nodes
+  geom_node_point(aes(filter = type == "CDR3", color = Category, size = size_metric), 
+                  alpha = 0.9) +
+  
+  # Secondary Motifs (Shape 19 = Circle) - Size Fixed
+  geom_node_point(aes(filter = type == "Motif" & !is_seed), 
+                  color = "black", size = MOTIF_SIZE, shape = 19) + 
+  
+  # Seed Motifs (Shape 18 = Diamond) - Size Fixed (Same as above)
+  geom_node_point(aes(filter = type == "Motif" & is_seed), 
+                  color = "black", size = MOTIF_SIZE*1.5, shape = 18) + 
+  
+  # CLUSTER TITLES (Placed manually on top)
+  geom_text(data = labels_master, aes(x = x, y = y, label = label), 
+            inherit.aes = FALSE, fontface = "bold", size = 5) +
+  
+  scale_color_manual(values = my_colors) +
+  scale_size_continuous(range = NODE_SIZE_RANGE, name = "Shared CDR3s") + 
+  
+  theme_void() + 
+  labs(title = "Top Specificity Clusters") +
+  theme(legend.position = "right", text = element_text(size = FONT_SIZE))
+
+print(p)
+
+
+ggsave("Top_Clusters_Final_mouse.pdf", plot = p, width = 9, height = 15, limitsize = FALSE)
+final_csv <- bind_rows(csv_export_list) %>% arrange(Cluster_Rank, desc(Shared_Count))
+write.csv(final_csv, "Top_Clusters_Composition_mouse.csv", row.names = FALSE)
+```
+
+
+
